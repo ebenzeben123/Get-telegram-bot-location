@@ -18,9 +18,22 @@ Telegram still has buffered (roughly the last 24 hours), and only works when no
 webhook is set. So the chat/topic list reflects *recent activity the bot has
 seen*, not necessarily every chat it has ever joined.
 
+IMPORTANT — the "competing consumer" gotcha:
+    getUpdates is a *destructive* read. The first client that fetches an update
+    and advances the offset causes Telegram to delete it; it is never served
+    again. If your real bot is already running (e.g. in Docker) it is polling
+    getUpdates and consuming every update before this script can see it, which
+    leaves the buffer empty here. To enumerate chats you must either:
+      * stop the running bot instance first, then post a NEW message in the
+        group and run this script (optionally with --watch), or
+      * log chat.id from inside the running bot itself.
+
 Usage:
-    python get_bot_location.py            # reads token from .env / environment
-    python get_bot_location.py <token>    # pass the token explicitly
+    python get_bot_location.py             # reads token from .env / environment
+    python get_bot_location.py <token>     # pass the token explicitly
+    python get_bot_location.py --watch     # wait for a fresh message and report
+                                           # its chat/topic (post in the group
+                                           # while this runs)
 """
 
 import json
@@ -205,21 +218,27 @@ def _record_topic(entry, message):
     entry["topics"][thread_id] = name
 
 
-def collect_chats(token):
-    """Pull recent updates and aggregate the chats and topics seen.
+def fetch_updates(token, offset=None, timeout=0):
+    """Call getUpdates and return the list of update objects.
 
-    Returns a dict keyed by chat_id. Raises RuntimeError on API error.
+    allowed_updates=[] would use defaults (excludes chat_member); pass an
+    explicit list so we also catch membership-only updates.
     """
-    chats = {}
-    # allowed_updates=[] would use defaults (excludes chat_member); pass an
-    # explicit list so we also catch membership-only updates.
     allowed = json.dumps(list(MESSAGE_FIELDS) + list(CHAT_ONLY_FIELDS))
-    updates = telegram_call(token, "getUpdates", {
+    params = {
         "limit": 100,
-        "timeout": 0,
+        "timeout": timeout,
         "allowed_updates": allowed,
-    })
+    }
+    if offset is not None:
+        params["offset"] = offset
+    return telegram_call(token, "getUpdates", params)
 
+
+def aggregate_chats(updates, chats=None):
+    """Fold a list of updates into a chats dict keyed by chat_id."""
+    if chats is None:
+        chats = {}
     for update in updates:
         for field in MESSAGE_FIELDS:
             msg = update.get(field)
@@ -232,8 +251,15 @@ def collect_chats(token):
             if not payload:
                 continue
             _record_chat(chats, payload.get("chat", {}))
-
     return chats
+
+
+def collect_chats(token):
+    """Pull recent updates and aggregate the chats and topics seen.
+
+    Returns a dict keyed by chat_id. Raises RuntimeError on API error.
+    """
+    return aggregate_chats(fetch_updates(token))
 
 
 def show_chats(token):
@@ -243,7 +269,12 @@ def show_chats(token):
         chats = collect_chats(token)
     except RuntimeError as exc:
         msg = str(exc)
-        if "409" in msg or "webhook" in msg.lower() or "getUpdates" in msg:
+        if "409" in msg or "terminated by other" in msg.lower():
+            print("409 Conflict: another process is already calling getUpdates")
+            print("for this bot (most likely your live bot, e.g. the Docker")
+            print("container). Telegram allows only ONE long-polling consumer at")
+            print("a time. Stop the other instance, then run this again.")
+        elif "webhook" in msg.lower():
             print("Cannot read updates because a webhook is active. Telegram only")
             print("allows getUpdates OR a webhook, not both. Remove the webhook")
             print("(deleteWebhook) temporarily to enumerate chats/topics this way.")
@@ -253,9 +284,19 @@ def show_chats(token):
 
     if not chats:
         print("No chats found in the recent update buffer.")
+        print("Most common cause: your real bot is already running (e.g. the")
+        print("Docker container in the screenshot) and is polling getUpdates. It")
+        print("consumes each update before this script can see it, leaving the")
+        print("buffer empty here -- getUpdates is a one-time, destructive read.")
+        print("")
+        print("To get the supergroup id, do ONE of these:")
+        print("  1. Stop the running bot instance, then post a NEW message in the")
+        print("     group and run:  python get_bot_location.py --watch")
+        print("  2. Log chat.id from inside the running bot when it handles a")
+        print("     message (it already receives every message).")
+        print("")
         print("Note: Telegram only buffers ~24h of updates, and the bot only")
-        print("learns about a chat when it receives an update from it. Send a")
-        print("message in the group/topic, then run this again.")
+        print("learns about a chat when it receives an update from it.")
         return
 
     # Group output by chat type for readability.
@@ -286,10 +327,79 @@ def show_chats(token):
     print("update buffer. It is not guaranteed to be every group the bot is in.")
 
 
+def watch_for_chat(token, rounds=12, timeout=10):
+    """Actively long-poll waiting for a fresh message, then report its chat.
+
+    Intended to be run while NO other instance is polling. Post a message in the
+    target group/topic while this is running and it will print the chat id.
+    """
+    print("\n=== Watch mode ===")
+    print("Waiting for a fresh update. Post a message in the target group/topic")
+    print("now. (Make sure no other bot instance is running, or you'll get a 409")
+    print("or the update will be consumed elsewhere.)")
+    print("Polling for up to {}s...".format(rounds * timeout))
+
+    offset = None
+    chats = {}
+    try:
+        # Skip whatever is already buffered so we only react to NEW messages,
+        # and advance the offset past it.
+        backlog = fetch_updates(token, timeout=0)
+        if backlog:
+            offset = backlog[-1]["update_id"] + 1
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "409" in msg or "terminated by other" in msg.lower():
+            print("409 Conflict: another process is polling getUpdates for this")
+            print("bot. Stop the running instance (e.g. the Docker container)")
+            print("and try --watch again.")
+            return
+        print("Could not start watching: {}".format(msg))
+        return
+
+    for _ in range(rounds):
+        try:
+            updates = fetch_updates(token, offset=offset, timeout=timeout)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "409" in msg or "terminated by other" in msg.lower():
+                print("409 Conflict mid-watch: another instance grabbed the")
+                print("update. Stop the other bot and retry.")
+                return
+            print("Error while watching: {}".format(msg))
+            return
+        if updates:
+            offset = updates[-1]["update_id"] + 1
+            aggregate_chats(updates, chats)
+            break
+
+    if not chats:
+        print("\nNo message received within the time window. Confirm the bot is")
+        print("in the group, no other instance is polling, and try again.")
+        return
+
+    print("\nCaptured the following chat(s):")
+    for chat in chats.values():
+        ctype = chat.get("type")
+        title = chat.get("title") or "(no title)"
+        username = " @{}".format(chat["username"]) if chat.get("username") else ""
+        forum = " [forum]" if chat.get("is_forum") else ""
+        print("  {} ({}){} -> id: {}{}".format(title, ctype, username, chat.get("id"), forum))
+        for thread_id, name in (chat.get("topics") or {}).items():
+            label = name if name else "(name unknown)"
+            print("    topic: {} (thread id: {})".format(label, thread_id))
+
+
 def main():
     load_env()
 
-    token = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("TELEGRAM_BOT_TOKEN")
+    args = sys.argv[1:]
+    watch = False
+    if "--watch" in args:
+        watch = True
+        args = [a for a in args if a != "--watch"]
+
+    token = args[0] if args else os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         print("Error: no bot token provided. Set TELEGRAM_BOT_TOKEN in .env "
               "or pass it as an argument.", file=sys.stderr)
@@ -298,7 +408,13 @@ def main():
     try:
         show_identity(token)
         webhook_active = show_webhook_location(token)
-        if webhook_active:
+        if watch:
+            if webhook_active:
+                print("\nWatch mode needs long polling, but a webhook is set.")
+                print("Run deleteWebhook first, then retry --watch.")
+            else:
+                watch_for_chat(token)
+        elif webhook_active:
             print("\n(Skipping chat enumeration: a webhook is set, so getUpdates")
             print(" is unavailable. See the note below.)")
             show_chats(token)  # will print the webhook-conflict guidance

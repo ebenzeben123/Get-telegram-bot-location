@@ -38,9 +38,31 @@ groups/supergroups/channels and **forum topics** the bot has recently seen.
 ```bash
 python get_bot_location.py            # reads TELEGRAM_BOT_TOKEN from .env
 python get_bot_location.py <token>    # or pass the token directly
+python get_bot_location.py --watch    # wait for a fresh message and report
+                                      # its chat/topic id live
 ```
 
 On Windows you can just double-click **`run.bat`**.
+
+### Can't see the supergroup? (most common issue)
+
+`getUpdates` is a **destructive, single-consumer read**: the first client to
+fetch an update and advance the offset causes Telegram to delete it, and it is
+never served again. If your **real bot is already running** (for example in a
+Docker container) it is long-polling `getUpdates` and consumes every update
+*before this script can see it* — so the buffer is empty here and no chats show
+up, no matter how privacy mode or admin rights are configured.
+
+To get the supergroup ID, do **one** of these:
+
+1. **Stop the running bot instance**, then post a *new* message in the group and
+   run `python get_bot_location.py --watch`. With no competing poller, the
+   script captures the message and prints the chat id (and topic id).
+2. **Log `chat.id` from inside the running bot** when it handles a message — it
+   already receives every message, so this needs no extra polling.
+
+If two pollers run at once you'll see `409 Conflict: terminated by other
+getUpdates request`; the script detects this and explains it.
 
 ## Important limitations (please read)
 
